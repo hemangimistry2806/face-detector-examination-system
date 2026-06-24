@@ -42,11 +42,16 @@ MAX_FACE_AREA_RATIO = 0.55
 MIN_FACE_CONFIDENCE = 1.5
 STRONG_FACE_CONFIDENCE = 4.0
 GAZE_THRESHOLD = 25.0
-GAZE_VIOLATION_DURATION = 3.0
+EYE_GAZE_THRESHOLD = 0.18
+GAZE_VIOLATION_DURATION = 5.0
+GAZE_SMOOTHING_ALPHA = 0.25
 
 voice_alarm_running = False
 last_gaze_screenshot_time = 0
 gaze_violation_start_time = None
+gaze_violation_screenshot_taken = False
+smoothed_gaze_score = 0.0
+sustained_gaze_direction = "looking center"
 SCREENSHOT_FOLDER = os.path.join(os.path.dirname(__file__), "exam_evidence")
 
 if not os.path.exists(SCREENSHOT_FOLDER):
@@ -228,62 +233,136 @@ def estimate_head_rotation(face_landmarks, image_width, image_height):
 
 
 def detect_eye_gaze(frame, face_landmarks, face_box):
-    """Detect where each eye is looking (left/center/right) based on pupil position in eye region."""
+    """Detect eye direction from MediaPipe iris landmarks with a pupil fallback."""
     if face_landmarks is None:
         return None
-    
-    x, y, w, h = face_box
-    
+
     def pt(index):
         lm = face_landmarks.landmark[index]
-        return np.array([lm.x * frame.shape[1], lm.y * frame.shape[0]], dtype=np.int32)
-    
-    # Eye corner landmarks (these exist in MediaPipe Face Mesh 0-467)
+        return np.array([lm.x * frame.shape[1], lm.y * frame.shape[0]], dtype=np.float32)
+
     left_eye_left = pt(33)
     left_eye_right = pt(133)
     left_eye_top = pt(160)
     left_eye_bottom = pt(158)
-    
+
     right_eye_left = pt(263)
     right_eye_right = pt(362)
     right_eye_top = pt(387)
     right_eye_bottom = pt(385)
-    
+
+    def direction_from_ratio(ratio):
+        if ratio < 0.5 - EYE_GAZE_THRESHOLD:
+            return "left"
+        if ratio > 0.5 + EYE_GAZE_THRESHOLD:
+            return "right"
+        return "center"
+
+    def iris_ratio(iris_indexes, eye_left, eye_right):
+        if len(face_landmarks.landmark) <= max(iris_indexes):
+            return None
+
+        iris_center = np.mean([pt(index) for index in iris_indexes], axis=0)
+        eye_vector = eye_right - eye_left
+        eye_width = np.linalg.norm(eye_vector)
+        if eye_width <= 1:
+            return None
+
+        ratio = np.dot(iris_center - eye_left, eye_vector) / (eye_width * eye_width)
+        return float(np.clip(ratio, 0.0, 1.0))
+
     def get_pupil_direction(frame, eye_left, eye_right, eye_top, eye_bottom):
         """Find pupil position within eye region to determine gaze direction."""
-        # Ensure coordinates are within bounds
-        x1, x2 = max(0, min(eye_left[0], eye_right[0])), min(frame.shape[1], max(eye_left[0], eye_right[0]))
-        y1, y2 = max(0, min(eye_top[1], eye_bottom[1])), min(frame.shape[0], max(eye_top[1], eye_bottom[1]))
-        
+        padding = 4
+        x1 = max(0, int(min(eye_left[0], eye_right[0])) - padding)
+        x2 = min(frame.shape[1], int(max(eye_left[0], eye_right[0])) + padding)
+        y1 = max(0, int(min(eye_top[1], eye_bottom[1])) - padding)
+        y2 = min(frame.shape[0], int(max(eye_top[1], eye_bottom[1])) + padding)
+
         if x2 <= x1 or y2 <= y1:
-            return "unknown"
-        
-        # Extract eye region
+            return None
+
         eye_region = frame[y1:y2, x1:x2]
         gray_eye = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY) if len(eye_region.shape) == 3 else eye_region
-        
-        # Find the darkest point (pupil) in the eye region
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(gray_eye)
+
+        gray_eye = cv2.GaussianBlur(gray_eye, (5, 5), 0)
+        _, _, min_loc, _ = cv2.minMaxLoc(gray_eye)
         pupil_x = min_loc[0]
         eye_width = x2 - x1
-        
-        # Determine direction based on pupil position
         pupil_ratio = pupil_x / max(eye_width, 1)
-        
-        if pupil_ratio < 0.35:
-            return "left"
-        elif pupil_ratio > 0.65:
-            return "right"
-        else:
-            return "center"
-    
+
+        return {
+            "direction": direction_from_ratio(pupil_ratio),
+            "ratio": float(pupil_ratio),
+            "center": (x1 + pupil_x, y1 + min_loc[1]),
+            "source": "pupil",
+        }
+
     try:
-        left_direction = get_pupil_direction(frame, left_eye_left, left_eye_right, left_eye_top, left_eye_bottom)
-        right_direction = get_pupil_direction(frame, right_eye_left, right_eye_right, right_eye_top, right_eye_bottom)
-        return {"left": left_direction, "right": right_direction}
+        left_ratio = iris_ratio([468, 469, 470, 471, 472], left_eye_left, left_eye_right)
+        right_ratio = iris_ratio([473, 474, 475, 476, 477], right_eye_left, right_eye_right)
+
+        left_eye = None
+        right_eye = None
+        if left_ratio is not None:
+            left_eye = {"direction": direction_from_ratio(left_ratio), "ratio": left_ratio, "source": "iris"}
+        if right_ratio is not None:
+            right_eye = {"direction": direction_from_ratio(right_ratio), "ratio": right_ratio, "source": "iris"}
+
+        if left_eye is None:
+            left_eye = get_pupil_direction(frame, left_eye_left, left_eye_right, left_eye_top, left_eye_bottom)
+        if right_eye is None:
+            right_eye = get_pupil_direction(frame, right_eye_left, right_eye_right, right_eye_top, right_eye_bottom)
+
+        if left_eye is None or right_eye is None:
+            return None
+
+        average_ratio = (left_eye["ratio"] + right_eye["ratio"]) / 2.0
+        combined_direction = direction_from_ratio(average_ratio)
+        return {
+            "left": left_eye["direction"],
+            "right": right_eye["direction"],
+            "direction": combined_direction,
+            "ratio": average_ratio,
+            "source": "iris" if left_eye["source"] == "iris" and right_eye["source"] == "iris" else "pupil",
+        }
     except Exception as e:
         print(f"Error in eye gaze detection: {e}")
         return None
+
+
+def smooth_gaze_state(pose, eye_gaze):
+    """Blend head pose and eye movement so brief noisy frames do not trigger alerts."""
+    global smoothed_gaze_score, sustained_gaze_direction
+
+    raw_score = 0.0
+    raw_direction = "looking center"
+
+    if eye_gaze is not None and eye_gaze["direction"] != "center":
+        eye_offset = abs(eye_gaze["ratio"] - 0.5)
+        raw_score = max(raw_score, min(1.0, eye_offset / 0.35))
+        raw_direction = f"looking {eye_gaze['direction']}"
+
+    if pose is not None and pose["direction"] != "looking center":
+        head_score = min(1.0, abs(pose["angle"]) / 45.0)
+        if head_score > raw_score:
+            raw_direction = pose["direction"]
+        raw_score = max(raw_score, head_score)
+
+    smoothed_gaze_score = (
+        GAZE_SMOOTHING_ALPHA * raw_score
+        + (1.0 - GAZE_SMOOTHING_ALPHA) * smoothed_gaze_score
+    )
+
+    if smoothed_gaze_score >= 0.55:
+        sustained_gaze_direction = raw_direction
+        return False, sustained_gaze_direction, smoothed_gaze_score
+
+    if smoothed_gaze_score <= 0.35:
+        sustained_gaze_direction = "looking center"
+        return True, sustained_gaze_direction, smoothed_gaze_score
+
+    return sustained_gaze_direction == "looking center", sustained_gaze_direction, smoothed_gaze_score
 
 
 def initialize_face_mesh_detector():
@@ -293,7 +372,7 @@ def initialize_face_mesh_detector():
     face_mesh_detector = mp_face_mesh.FaceMesh(
         static_image_mode=False,
         max_num_faces=2,
-        refine_landmarks=False,
+        refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
@@ -432,7 +511,8 @@ def classify_hand_gesture(hand_landmarks):
 
 
 def main():
-    global hand_detector, gaze_violation_start_time
+    global hand_detector, gaze_violation_start_time, gaze_violation_screenshot_taken
+    global smoothed_gaze_score, sustained_gaze_direction
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
     if face_cascade.empty():
@@ -497,6 +577,8 @@ def main():
             eye_gazes = []
             gaze_violation = False
             gaze_message = None
+            current_gaze_direction = "looking center"
+            current_gaze_score = 0.0
             current_time = time.time()
             
             if mp_face_mesh_available and face_mesh_detector is not None:
@@ -518,9 +600,11 @@ def main():
                             if eye_gaze is not None:
                                 eye_gazes.append(eye_gaze)
                         
-                        if pose is not None:
-                            # Check if user is looking away
-                            if pose['direction'] != 'looking center' and face_count == 1:
+                        if pose is not None and face_count == 1:
+                            eye_gaze = eye_gazes[-1] if eye_gazes else None
+                            looking_center, current_gaze_direction, current_gaze_score = smooth_gaze_state(pose, eye_gaze)
+
+                            if not looking_center:
                                 # Start timer if not already started
                                 if gaze_violation_start_time is None:
                                     gaze_violation_start_time = current_time
@@ -529,13 +613,25 @@ def main():
                                 time_looking_away = current_time - gaze_violation_start_time
                                 if time_looking_away >= GAZE_VIOLATION_DURATION:
                                     gaze_violation = True
-                                    gaze_message = f"Warning. {pose['direction'].capitalize()}. Please focus on camera."
-                                    # Take screenshot only once per violation event
-                                    if time_looking_away < GAZE_VIOLATION_DURATION + 0.5:
-                                        save_violation_screenshot(frame, "gaze_violation", pose['direction'])
+                                    gaze_message = "Warning. Please focus on your paper or exam."
+                                    if not gaze_violation_screenshot_taken:
+                                        screenshot_detail = current_gaze_direction.replace(" ", "_")
+                                        save_violation_screenshot(frame, "gaze_violation", screenshot_detail)
+                                        gaze_violation_screenshot_taken = True
                             else:
                                 # User is looking center, reset timer
                                 gaze_violation_start_time = None
+                                gaze_violation_screenshot_taken = False
+                        elif face_count != 1:
+                            gaze_violation_start_time = None
+                            gaze_violation_screenshot_taken = False
+                            smoothed_gaze_score = 0.0
+                            sustained_gaze_direction = "looking center"
+                else:
+                    gaze_violation_start_time = None
+                    gaze_violation_screenshot_taken = False
+                    smoothed_gaze_score = 0.0
+                    sustained_gaze_direction = "looking center"
 
             for idx, face_info in enumerate(faces):
                 x, y, w, h, eye_confirmed = face_info
@@ -560,7 +656,7 @@ def main():
                 # Display eye gaze direction
                 if idx < len(eye_gazes):
                     eye_gaze = eye_gazes[idx]
-                    eye_text = f"L:{eye_gaze['left']} R:{eye_gaze['right']}"
+                    eye_text = f"L:{eye_gaze['left']} R:{eye_gaze['right']} ({eye_gaze['source']})"
                     cv2.putText(
                         frame,
                         f"Eyes: {eye_text}",
@@ -570,6 +666,16 @@ def main():
                         (255, 165, 0),
                         2,
                     )
+                    if face_count == 1:
+                        cv2.putText(
+                            frame,
+                            f"Focus score: {current_gaze_score:.2f}",
+                            (x, y + h + 50),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 255, 255) if current_gaze_score < 0.55 else (0, 0, 255),
+                            2,
+                        )
 
             hand_gesture_summary = "hands unavailable"
             gesture_violation = False
@@ -609,7 +715,7 @@ def main():
                         (0, 255, 255) if hand_gesture_summary != "no hands" else (255, 255, 0), 2)
 
             if gaze_violation:
-                draw_error_banner(frame, "ERROR: Please focus on camera")
+                draw_error_banner(frame, "ERROR: Please focus on your paper or exam")
             elif gesture_violation:
                 draw_error_banner(frame, "ERROR: Conduct violation")
             elif face_count == 0:
