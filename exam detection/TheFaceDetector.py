@@ -45,6 +45,11 @@ GAZE_THRESHOLD = 25.0
 EYE_GAZE_THRESHOLD = 0.18
 GAZE_VIOLATION_DURATION = 5.0
 GAZE_SMOOTHING_ALPHA = 0.25
+FACE_MISSING_SCREENSHOT_DELAY = 2.0
+SCREENSHOT_COOLDOWN = 15.0
+TALKING_VIOLATION_DURATION = 3.0
+MOUTH_OPEN_THRESHOLD = 0.08
+MOUTH_SMOOTHING_ALPHA = 0.35
 
 voice_alarm_running = False
 last_gaze_screenshot_time = 0
@@ -52,6 +57,13 @@ gaze_violation_start_time = None
 gaze_violation_screenshot_taken = False
 smoothed_gaze_score = 0.0
 sustained_gaze_direction = "looking center"
+face_missing_start_time = None
+face_missing_screenshot_taken = False
+multiple_faces_screenshot_taken = False
+talking_start_time = None
+talking_screenshot_taken = False
+smoothed_mouth_open_ratio = 0.0
+last_screenshot_by_type = {}
 SCREENSHOT_FOLDER = os.path.join(os.path.dirname(__file__), "exam_evidence")
 
 if not os.path.exists(SCREENSHOT_FOLDER):
@@ -70,11 +82,13 @@ def save_violation_screenshot(frame, violation_type, details):
     global last_gaze_screenshot_time
     
     current_time = time.time()
-    # Limit screenshots to one per second to avoid spam
-    if current_time - last_gaze_screenshot_time < 1.0:
+    screenshot_key = f"{violation_type}:{details}"
+    last_screenshot_time = last_screenshot_by_type.get(screenshot_key, 0)
+    if current_time - last_screenshot_time < SCREENSHOT_COOLDOWN:
         return
     
     last_gaze_screenshot_time = current_time
+    last_screenshot_by_type[screenshot_key] = current_time
     
     try:
         timestamp = time.strftime("%Y%m%d_%H%M%S_") + f"{int((current_time % 1) * 1000):03d}"
@@ -230,6 +244,58 @@ def estimate_head_rotation(face_landmarks, image_width, image_height):
         direction = "looking center"
 
     return {"angle": gaze_angle, "direction": direction}
+
+
+def face_box_from_landmarks(face_landmarks, image_width, image_height):
+    if face_landmarks is None:
+        return None
+
+    xs = [lm.x * image_width for lm in face_landmarks.landmark]
+    ys = [lm.y * image_height for lm in face_landmarks.landmark]
+    x1 = max(0, int(min(xs)))
+    y1 = max(0, int(min(ys)))
+    x2 = min(image_width, int(max(xs)))
+    y2 = min(image_height, int(max(ys)))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    padding_x = int((x2 - x1) * 0.12)
+    padding_y = int((y2 - y1) * 0.18)
+    x1 = max(0, x1 - padding_x)
+    y1 = max(0, y1 - padding_y)
+    x2 = min(image_width, x2 + padding_x)
+    y2 = min(image_height, y2 + padding_y)
+    return (x1, y1, x2 - x1, y2 - y1, True)
+
+
+def detect_talking(face_landmarks, image_width, image_height):
+    """Estimate talking from sustained mouth opening."""
+    global smoothed_mouth_open_ratio
+
+    if face_landmarks is None:
+        smoothed_mouth_open_ratio = 0.0
+        return False, 0.0
+
+    def pt(index):
+        lm = face_landmarks.landmark[index]
+        return np.array([lm.x * image_width, lm.y * image_height], dtype=np.float32)
+
+    upper_lip = pt(13)
+    lower_lip = pt(14)
+    left_mouth = pt(61)
+    right_mouth = pt(291)
+
+    mouth_width = np.linalg.norm(right_mouth - left_mouth)
+    if mouth_width <= 1:
+        return False, smoothed_mouth_open_ratio
+
+    mouth_open_ratio = np.linalg.norm(lower_lip - upper_lip) / mouth_width
+    smoothed_mouth_open_ratio = (
+        MOUTH_SMOOTHING_ALPHA * mouth_open_ratio
+        + (1.0 - MOUTH_SMOOTHING_ALPHA) * smoothed_mouth_open_ratio
+    )
+    return smoothed_mouth_open_ratio >= MOUTH_OPEN_THRESHOLD, smoothed_mouth_open_ratio
 
 
 def detect_eye_gaze(frame, face_landmarks, face_box):
@@ -513,6 +579,8 @@ def classify_hand_gesture(hand_landmarks):
 def main():
     global hand_detector, gaze_violation_start_time, gaze_violation_screenshot_taken
     global smoothed_gaze_score, sustained_gaze_direction
+    global face_missing_start_time, face_missing_screenshot_taken, multiple_faces_screenshot_taken
+    global talking_start_time, talking_screenshot_taken, smoothed_mouth_open_ratio
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
     if face_cascade.empty():
@@ -549,6 +617,24 @@ def main():
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.equalizeHist(gray)
             faces = filter_face_detections(face_cascade, eye_cascade, gray, frame.shape)
+            current_time = time.time()
+
+            rgb_frame = None
+            mesh_face_landmarks = []
+            if mp_face_mesh_available and face_mesh_detector is not None:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb_frame.flags.writeable = False
+                mesh_results = face_mesh_detector.process(rgb_frame)
+                rgb_frame.flags.writeable = True
+                mesh_face_landmarks = list(getattr(mesh_results, 'multi_face_landmarks', None) or [])
+
+                if mesh_face_landmarks and len(faces) < len(mesh_face_landmarks):
+                    existing_boxes = [face[:4] for face in faces]
+                    for face_landmarks in mesh_face_landmarks:
+                        mesh_box = face_box_from_landmarks(face_landmarks, frame.shape[1], frame.shape[0])
+                        if mesh_box is not None and all(box_iou(mesh_box[:4], box) < 0.25 for box in existing_boxes):
+                            faces.append(mesh_box)
+                            existing_boxes.append(mesh_box[:4])
 
             face_count = len(faces)
             alarm_needed = False
@@ -561,33 +647,43 @@ def main():
                 alarm_needed = True
                 no_face_alarm = True
                 alarm_message = "Warning. Face not detected. Please stay in front of the camera."
-                save_violation_screenshot(frame, "face_violation", "no_face_detected")
+                if face_missing_start_time is None:
+                    face_missing_start_time = current_time
+                if (
+                    current_time - face_missing_start_time >= FACE_MISSING_SCREENSHOT_DELAY
+                    and not face_missing_screenshot_taken
+                ):
+                    save_violation_screenshot(frame, "face_violation", "no_face_detected")
+                    face_missing_screenshot_taken = True
             elif face_count > 1:
                 status_text = f"ERROR: Multiple faces detected ({face_count})"
                 status_color = (0, 0, 255)
                 alarm_needed = True
                 alarm_message = "Warning. Multiple faces detected. Only one person is allowed."
-                save_violation_screenshot(frame, "face_violation", f"multiple_faces_{face_count}")
+                face_missing_start_time = None
+                face_missing_screenshot_taken = False
+                if not multiple_faces_screenshot_taken:
+                    save_violation_screenshot(frame, "face_violation", f"multiple_faces_{face_count}")
+                    multiple_faces_screenshot_taken = True
             else:
                 status_text = "One face detected"
                 status_color = (0, 255, 0)
+                face_missing_start_time = None
+                face_missing_screenshot_taken = False
+                multiple_faces_screenshot_taken = False
 
-            rgb_frame = None
             face_poses = []
             eye_gazes = []
             gaze_violation = False
             gaze_message = None
             current_gaze_direction = "looking center"
             current_gaze_score = 0.0
-            current_time = time.time()
+            talking_detected = False
+            talking_violation = False
+            talking_ratio = smoothed_mouth_open_ratio
             
-            if mp_face_mesh_available and face_mesh_detector is not None:
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                rgb_frame.flags.writeable = False
-                mesh_results = face_mesh_detector.process(rgb_frame)
-                rgb_frame.flags.writeable = True
-                if getattr(mesh_results, 'multi_face_landmarks', None):
-                    for idx, face_landmarks in enumerate(mesh_results.multi_face_landmarks):
+            if mesh_face_landmarks:
+                    for idx, face_landmarks in enumerate(mesh_face_landmarks):
                         pose = estimate_head_rotation(face_landmarks, frame.shape[1], frame.shape[0])
                         
                         if pose is not None:
@@ -622,16 +718,32 @@ def main():
                                 # User is looking center, reset timer
                                 gaze_violation_start_time = None
                                 gaze_violation_screenshot_taken = False
+
+                            talking_detected, talking_ratio = detect_talking(face_landmarks, frame.shape[1], frame.shape[0])
+                            if talking_detected:
+                                if talking_start_time is None:
+                                    talking_start_time = current_time
+                                if current_time - talking_start_time >= TALKING_VIOLATION_DURATION:
+                                    talking_violation = True
+                                    if not talking_screenshot_taken:
+                                        save_violation_screenshot(frame, "talking_violation", "mouth_open_or_talking")
+                                        talking_screenshot_taken = True
+                            else:
+                                talking_start_time = None
+                                talking_screenshot_taken = False
                         elif face_count != 1:
                             gaze_violation_start_time = None
                             gaze_violation_screenshot_taken = False
                             smoothed_gaze_score = 0.0
                             sustained_gaze_direction = "looking center"
-                else:
-                    gaze_violation_start_time = None
-                    gaze_violation_screenshot_taken = False
-                    smoothed_gaze_score = 0.0
-                    sustained_gaze_direction = "looking center"
+            else:
+                gaze_violation_start_time = None
+                gaze_violation_screenshot_taken = False
+                talking_start_time = None
+                talking_screenshot_taken = False
+                smoothed_gaze_score = 0.0
+                sustained_gaze_direction = "looking center"
+                smoothed_mouth_open_ratio = 0.0
 
             for idx, face_info in enumerate(faces):
                 x, y, w, h, eye_confirmed = face_info
@@ -702,6 +814,12 @@ def main():
                 alarm_needed = True
                 no_face_alarm = False
                 alarm_message = gaze_message
+            elif talking_violation:
+                status_text = "ERROR: Talking detected"
+                status_color = (0, 0, 255)
+                alarm_needed = True
+                no_face_alarm = False
+                alarm_message = "Warning. Talking detected. Please stay silent during the exam."
             elif gesture_violation:
                 status_text = "ERROR: Conduct violation"
                 status_color = (0, 0, 255)
@@ -713,9 +831,21 @@ def main():
             cv2.putText(frame, status_text, (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
             cv2.putText(frame, f"Hand gestures: {hand_gesture_summary}", (10, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                         (0, 255, 255) if hand_gesture_summary != "no hands" else (255, 255, 0), 2)
+            talking_text = "talking" if talking_detected else "silent"
+            cv2.putText(
+                frame,
+                f"Talking: {talking_text} ({talking_ratio:.2f})",
+                (10, 96),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255) if talking_violation else (255, 255, 0),
+                2,
+            )
 
             if gaze_violation:
                 draw_error_banner(frame, "ERROR: Please focus on your paper or exam")
+            elif talking_violation:
+                draw_error_banner(frame, "ERROR: Talking detected")
             elif gesture_violation:
                 draw_error_banner(frame, "ERROR: Conduct violation")
             elif face_count == 0:
