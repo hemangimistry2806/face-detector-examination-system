@@ -10,6 +10,7 @@ This project is a Python-based examination monitoring system. It uses the webcam
 - Shows live status messages on the camera window
 - Plays alert sounds or voice warnings on supported Windows systems
 - Saves evidence screenshots in a local ignored folder
+- Saves short audio evidence clips when sustained talking is detected
 
 ## Project Structure
 
@@ -41,12 +42,16 @@ exam detection/
 
 `pywin32` is optional. It allows the system to use Windows text-to-speech voice alerts. If it is not installed, the program can still run with beep alerts.
 
+### sounddevice
+
+`sounddevice` is optional. It allows the system to record a short `.wav` audio clip when talking is detected during the exam. If it is not installed, talking screenshots still work, but audio evidence will be skipped.
+
 ## Installation
 
 Install the required Python libraries:
 
 ```bash
-pip install opencv-python numpy mediapipe pywin32
+pip install opencv-python numpy mediapipe pywin32 sounddevice
 ```
 
 If you do not need voice alerts, `pywin32` can be skipped:
@@ -65,15 +70,15 @@ python "exam detection/TheFaceDetector.py"
 
 The webcam window will open and start monitoring. Press `q` to close the program.
 
-## Evidence Photos
+## Evidence Files
 
-Violation screenshots are saved inside:
+Violation screenshots and talking audio clips are saved inside:
 
 ```text
 exam detection/exam_evidence/
 ```
 
-This folder is ignored by Git because evidence photos may contain private exam or face data. The code is shared on GitHub, but generated evidence images are kept only on your local computer.
+This folder is ignored by Git because evidence may contain private exam, face, or voice data. The code is shared on GitHub, but generated evidence files are kept only on your local computer.
 
 ## Notes
 

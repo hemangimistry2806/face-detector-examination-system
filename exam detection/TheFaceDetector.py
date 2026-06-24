@@ -2,6 +2,7 @@ import cv2
 import os
 import time
 import threading
+import wave
 
 import numpy as np
 
@@ -21,6 +22,11 @@ try:
     import mediapipe as mp
 except Exception:
     mp = None
+
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
 
 mp_face_mesh = mp.solutions.face_mesh if mp else None
 try:
@@ -50,6 +56,8 @@ SCREENSHOT_COOLDOWN = 15.0
 TALKING_VIOLATION_DURATION = 3.0
 MOUTH_OPEN_THRESHOLD = 0.08
 MOUTH_SMOOTHING_ALPHA = 0.35
+AUDIO_RECORD_SECONDS = 10
+AUDIO_SAMPLE_RATE = 16000
 
 voice_alarm_running = False
 last_gaze_screenshot_time = 0
@@ -62,8 +70,10 @@ face_missing_screenshot_taken = False
 multiple_faces_screenshot_taken = False
 talking_start_time = None
 talking_screenshot_taken = False
+talking_audio_taken = False
 smoothed_mouth_open_ratio = 0.0
 last_screenshot_by_type = {}
+audio_recording_running = False
 SCREENSHOT_FOLDER = os.path.join(os.path.dirname(__file__), "exam_evidence")
 
 if not os.path.exists(SCREENSHOT_FOLDER):
@@ -120,6 +130,48 @@ def save_violation_screenshot(frame, violation_type, details):
         print(f"[EVIDENCE] Screenshot saved: {filename}")
     except Exception as e:
         print(f"Error saving screenshot: {e}")
+
+
+def record_audio_evidence(details, duration=AUDIO_RECORD_SECONDS):
+    """Save a short microphone recording for a talking violation."""
+    global audio_recording_running
+
+    if sd is None or audio_recording_running:
+        if sd is None:
+            print("[AUDIO] sounddevice not installed. Run: pip install sounddevice")
+        return
+
+    audio_recording_running = True
+
+    def _record():
+        global audio_recording_running
+        try:
+            timestamp = time.strftime("%Y%m%d_%H%M%S_") + f"{int((time.time() % 1) * 1000):03d}"
+            filename = f"talking_audio_{details}_{timestamp}.wav"
+            filepath = os.path.join(SCREENSHOT_FOLDER, filename)
+
+            print(f"[AUDIO] Recording {duration} seconds: {filename}")
+            audio = sd.rec(
+                int(duration * AUDIO_SAMPLE_RATE),
+                samplerate=AUDIO_SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+            )
+            sd.wait()
+
+            with wave.open(filepath, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(AUDIO_SAMPLE_RATE)
+                wav_file.writeframes(audio.tobytes())
+
+            print(f"[AUDIO] Evidence saved: {filename}")
+        except Exception as e:
+            print(f"Error recording audio evidence: {e}")
+        finally:
+            audio_recording_running = False
+
+    threading.Thread(target=_record, daemon=True).start()
 
 
 def simple_alarm():
@@ -580,7 +632,7 @@ def main():
     global hand_detector, gaze_violation_start_time, gaze_violation_screenshot_taken
     global smoothed_gaze_score, sustained_gaze_direction
     global face_missing_start_time, face_missing_screenshot_taken, multiple_faces_screenshot_taken
-    global talking_start_time, talking_screenshot_taken, smoothed_mouth_open_ratio
+    global talking_start_time, talking_screenshot_taken, talking_audio_taken, smoothed_mouth_open_ratio
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
     if face_cascade.empty():
@@ -728,9 +780,13 @@ def main():
                                     if not talking_screenshot_taken:
                                         save_violation_screenshot(frame, "talking_violation", "mouth_open_or_talking")
                                         talking_screenshot_taken = True
+                                    if not talking_audio_taken:
+                                        record_audio_evidence("mouth_open_or_talking")
+                                        talking_audio_taken = True
                             else:
                                 talking_start_time = None
                                 talking_screenshot_taken = False
+                                talking_audio_taken = False
                         elif face_count != 1:
                             gaze_violation_start_time = None
                             gaze_violation_screenshot_taken = False
@@ -741,6 +797,7 @@ def main():
                 gaze_violation_screenshot_taken = False
                 talking_start_time = None
                 talking_screenshot_taken = False
+                talking_audio_taken = False
                 smoothed_gaze_score = 0.0
                 sustained_gaze_direction = "looking center"
                 smoothed_mouth_open_ratio = 0.0
